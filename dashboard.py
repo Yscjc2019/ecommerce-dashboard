@@ -320,7 +320,8 @@ with rfm_tab:
           y="客户分层",
           orientation="h",
           color="平均净消费",
-          color_continuous_scale="Blues",
+          # 替换为从清晰中浅蓝到深蓝的渐变，彻底告别“白底隐身”
+          color_continuous_scale=["#93C5FD", "#3B82F6", "#1D4ED8", "#1E3A8A"],
           text="展示标签",
           custom_data=["人数占比", "平均净消费"],
           labels={
@@ -328,6 +329,21 @@ with rfm_tab:
               "客户分层": "",
               "平均净消费": "平均净消费（元）",
           },
+      )
+
+      max_count = segment_summary["客户人数"].max()
+      bar_chart.update_traces(
+          textposition="outside",
+          cliponaxis=False,
+          textfont=dict(size=13),
+          marker_line=dict(
+              color="#64748B", width=0.8
+          ),  # 给柱子加上极细边框，边界更锐利
+          hovertemplate=(
+              "<b>%{y}</b><br>客户人数：%{x} 人"
+              " (%{customdata:.1f}%)<br>平均净消费："
+              " ¥%{customdata:,.2f}<extra></extra>"
+          ),
       )
 
       # 留出右侧充足空白，确保最短柱子右侧的文字也能完整展示不被截断
