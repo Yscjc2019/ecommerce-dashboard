@@ -1,0 +1,38 @@
+name: Daily Gold Price Tracker
+
+on:
+  schedule:
+    # 每天 UTC 时间 01:00 运行（即东京时间每天上午 10:00 / 北京时间每天上午 09:00）
+    - cron: '0 1 * * *'
+  # 允许你在 GitHub 网页上随时点击按钮手动触发测试！
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-gold-price:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. 拉取最新仓库代码与数据库
+        uses: actions/checkout@v4
+
+      - name: 2. 配置 Python 3.11 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 3. 安装请求依赖库
+        run: pip install requests urllib3
+
+      - name: 4. 运行黄金行情抓取脚本更新 shop.db
+        run: python gold_tracker.py
+
+      - name: 5. 自动提交更新后的数据库回仓库
+        run: |
+          git config --local user.email "github-actions[bot]@://github.com"
+          git config --local user.name "github-actions[bot]"
+          git add shop.db
+          git diff --quiet && git diff --staged --quiet || git commit -m "chore: 自动更新每日黄金行情数据"
+          git push
