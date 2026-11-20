@@ -6,6 +6,9 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+import os
+import requests
+
 
 DATABASE_PATH = Path(__file__).resolve().with_name("shop.db")
 
@@ -34,6 +37,129 @@ def load_orders() -> pd.DataFrame:
     """
     with closing(sqlite3.connect(DATABASE_PATH)) as connection:
         return pd.read_sql_query(query, connection)
+
+@st.cache_data(ttl=60)
+def load_price_monitors() -> tuple[pd.DataFrame, pd.DataFrame]:
+  """从 shop.db 读取黄金行情与牛奶巡检记录"""
+  with closing(sqlite3.connect(DATABASE_PATH)) as conn:
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    gold_df = (
+        pd.read_sql_query(
+            "SELECT * FROM gold_prices ORDER BY record_date", conn
+        )
+        if "gold_prices" in tables
+        else pd.DataFrame()
+    )
+    milk_df = (
+        pd.read_sql_query(
+            "SELECT * FROM milk_prices ORDER BY record_date", conn
+        )
+        if "milk_prices" in tables
+        else pd.DataFrame()
+    )
+  return gold_df, milk_df
+
+
+def retrieve_rag_context(
+    orders_df: pd.DataFrame,
+    rfm_df: pd.DataFrame,
+    gold_df: pd.DataFrame,
+    milk_df: pd.DataFrame,
+) -> str:
+  """RAG 检索阶段（Retrieval）：从多张数据库表中提取最新统计摘要作为私有知识库上下文"""
+  total_sales = orders_df["amount"].sum()
+  net_sales = total_sales - orders_df["refund_amount"].sum()
+  top_cat = (
+      orders_df.groupby("category")["amount"].sum().idxmax()
+      if not orders_df.empty
+      else "无"
+  )
+  vip_count = len(rfm_df[rfm_df["客户分层"] == "重要价值客户（核心金主）"])
+
+  gold_summary = "暂无黄金行情数据。"
+  if not gold_df.empty:
+    latest_g = gold_df.iloc[-1]
+    min_g = gold_df["price_cny_g"].min()
+    max_g = gold_df["price_cny_g"].max()
+    gold_summary = (
+        f"近30天黄金价格区间为 ¥{min_g:.2f}/克 ~ ¥{max_g:.2f}/克，"
+        f"最新（{latest_g['record_date']}）价格为 ¥{latest_g['price_cny_g']:.2f}/克。"
+    )
+
+  milk_summary = "暂无牛奶采价记录。"
+  if not milk_df.empty:
+    records_str = "；".join([
+        f"{r['record_date']}: 状态[{r['status']}], 价格[{r['price'] if pd.notna(r['price']) else '无'}], 备注[{r['feedback']}]"
+        for _, r in milk_df.iterrows()
+    ])
+    milk_summary = f"牛奶采价历史明细：{records_str}"
+
+  return (
+      "【私有数据库实时检索上下文】\n"
+      f"1. 电商经营概况：总销售额 ¥{total_sales:,.2f}，净销售额 ¥{net_sales:,.2f}，销售额最高品类为【{top_cat}】，核心金主客户共 {vip_count} 人。\n"
+      f"2. 黄金行情监控：{gold_summary}\n"
+      f"3. 牛奶巡检监控：{milk_summary}\n"
+  )
+
+
+def generate_rag_answer(
+    question: str, context: str, api_key: str, base_url: str, model_name: str
+) -> str:
+  """RAG 生成阶段（Generation）：结合检索到的私有数据库上下文回答用户提问"""
+  if api_key.strip():
+    try:
+      headers = {
+          "Authorization": f"Bearer {api_key.strip()}",
+          "Content-Type": "application/json",
+      }
+      payload = {
+          "model": model_name.strip() or "deepseek-chat",
+          "messages": [
+              {
+                  "role": "system",
+                  "content": (
+                      "你是一个严谨的商业数据分析助手。请严格基于以下【私有数据库实时检索上下文】回答用户的问题，给出具体数据支撑，不要编造上下文中不存在的数据：\n\n"
+                      + context
+                  ),
+              },
+              {"role": "user", "content": question},
+          ],
+          "temperature": 0.3,
+      }
+      resp = requests.post(
+          f"{base_url.rstrip('/')}/chat/completions",
+          headers=headers,
+          json=payload,
+          timeout=20,
+      )
+      resp.raise_for_status()
+      return resp.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+      return f"⚠️ 大模型 API 调用失败（{e}），以下为您展示直接从数据库检索到的核心事实：\n\n{context}"
+
+  # 未填写 API Key 时的本地智能检索兜底引擎（开箱即用）
+  q = question.lower()
+  if "牛奶" in q or "下架" in q:
+    return (
+        "📊 **基于 `milk_prices` 表的实时检索结果：**\n\n"
+        + context.split("3. 牛奶巡检监控：")[1]
+        + "\n\n💡 *提示：在左侧边栏填入大模型 API Key 后，我还可以为你进行更深度的消费趋势推理。*"
+    )
+  if "黄金" in q or "金价" in q:
+    return (
+        "📊 **基于 `gold_prices` 表的实时检索结果：**\n\n"
+        + context.split("2. 黄金行情监控：")[1].split("3. 牛奶巡检监控：")[0]
+    )
+  return (
+      "📊 **已为您从 `shop.db` 多张业务表中检索到以下实时数据摘要：**\n\n"
+      + context
+  )
+
 
 
 def calculate_rfm(orders: pd.DataFrame) -> pd.DataFrame:
@@ -113,8 +239,9 @@ rfm_customers = calculate_rfm(orders)
 if selected_cities:
     rfm_customers = rfm_customers[rfm_customers["city"].isin(selected_cities)].copy()
 
-overview_tab, rfm_tab = st.tabs(
-    ["📊 销售与退款总览", "💎 客户价值分层 (RFM)"]
+gold_prices, milk_prices = load_price_monitors()
+overview_tab, rfm_tab, monitor_tab = st.tabs(
+    ["📊 销售与退款总览", "💎 客户价值分层 (RFM)", "📈 价格监控与 AI 助手 (RAG)"]
 )
 
 with overview_tab:
@@ -406,3 +533,124 @@ with rfm_tab:
               "客户分层": st.column_config.TextColumn("客户分层", width="large"),
           },
       )
+
+with monitor_tab:
+  st.subheader("双轨商品价格与状态监控中心")
+  p_col1, p_col2 = st.columns(2)
+
+  with p_col1:
+    st.markdown("#### 🟡 路线一：黄金行情近 30 天走势（全自动采集）")
+    if gold_prices.empty:
+      st.info("暂无黄金行情数据，请先运行 `gold_tracker.py`。")
+    else:
+      latest_gold = gold_prices.iloc[-1]["price_cny_g"]
+      first_gold = gold_prices.iloc[0]["price_cny_g"]
+      diff_gold = latest_gold - first_gold
+      st.metric(
+          "最新参考金价（元/克）",
+          f"¥{latest_gold:,.2f}",
+          f"{diff_gold:+.2f} 元（近30日）",
+      )
+      g_chart = px.line(
+          gold_prices,
+          x="record_date",
+          y="price_cny_g",
+          markers=True,
+          labels={"record_date": "日期", "price_cny_g": "价格（元/克）"},
+      )
+      g_chart.update_layout(
+          height=350,
+          xaxis_title=None,
+          yaxis_title="元/克",
+          margin=dict(t=10, l=10, r=10, b=10),
+      )
+      st.plotly_chart(g_chart, width="stretch")
+
+  with p_col2:
+    st.markdown("#### 🥛 路线二：牛奶人工采价与下架状态闭环")
+    if milk_prices.empty:
+      st.info("暂无牛奶采价记录，请先运行 `milk_watchdog.py`。")
+    else:
+      latest_milk = milk_prices.iloc[-1]
+      status_str = latest_milk["status"]
+      price_display = (
+          f"¥{latest_milk['price']:.2f}"
+          if pd.notna(latest_milk["price"])
+          else "已下架（无报价）"
+      )
+      st.metric(
+          f"最新状态（{latest_milk['record_date']}）",
+          price_display,
+          status_str,
+          delta_color="normal" if status_str == "在售" else "inverse",
+      )
+      # 仅对有价格的日期绘制折线，并在表格中完整展示包括“已下架”在内的所有反馈闭环
+      valid_milk = milk_prices.dropna(subset=["price"])
+      if not valid_milk.empty:
+        m_chart = px.line(
+            valid_milk,
+            x="record_date",
+            y="price",
+            markers=True,
+            labels={"record_date": "日期", "price": "价格（元）"},
+        )
+        m_chart.update_layout(
+            height=240,
+            xaxis_title=None,
+            yaxis_title="元",
+            margin=dict(t=10, l=10, r=10, b=10),
+        )
+        st.plotly_chart(m_chart, width="stretch")
+
+      milk_display = milk_prices[[
+            "record_date",
+            "status",
+            "price",
+            "feedback",
+        ]].copy()
+      
+    st.dataframe(
+        milk_display,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "record_date": st.column_config.TextColumn(
+                "记录日期", width="small"
+            ),
+            "status": st.column_config.TextColumn("状态", width="small"),
+            "price": st.column_config.NumberColumn(
+                "价格", format="¥%.2f", width="small"
+            ),
+            "feedback": st.column_config.TextColumn(
+                "状态/下架反馈记录", width="large"
+            ),
+        },
+    )
+
+  st.divider()
+  st.subheader("🤖 私有数据 RAG 智能分析助手")
+  st.caption(
+      "系统会自动从 SQLite 数据库检索最新销售、退款、RFM 分层、黄金与牛奶状态数据作为知识库上下文进行回答。"
+  )
+
+  with st.expander("⚙️ 大模型 API 配置（可选：不填也可使用内置检索分析引擎）"):
+    c1, c2, c3 = st.columns(3)
+    rag_api_key = c1.text_input("API Key", type="password", placeholder="sk-...")
+    rag_base_url = c2.text_input("Base URL", value="https://deepseek.com")
+    rag_model = c3.text_input("模型名称", value="deepseek-chat")
+
+  user_q = st.text_input(
+      "向你的专属数据库提问：",
+      placeholder="例如：最近牛奶有没有下架记录？近30天黄金价格最高是多少？",
+  )
+  if user_q:
+    rag_context = retrieve_rag_context(
+        orders, rfm_customers, gold_prices, milk_prices
+    )
+    with st.spinner("正在检索数据库并生成分析..."):
+      answer = generate_rag_answer(
+          user_q, rag_context, rag_api_key, rag_base_url, rag_model
+      )
+    st.markdown(answer)
+    with st.expander("🔍 查看底层检索到的数据库上下文（RAG Retrieval Evidence）"):
+      st.text(rag_context)
