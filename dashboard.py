@@ -272,81 +272,102 @@ with overview_tab:
     )
 
 with rfm_tab:
-    st.subheader("客户价值分层分布")
-    segments = sorted(rfm_customers["客户分层"].unique().tolist())
+  st.subheader("客户价值分层分布")
+  if rfm_customers.empty:
+    st.info("当前筛选条件下没有客户数据。")
+  else:
+    available_segments = sorted(rfm_customers["客户分层"].unique().tolist())
     selected_segments = st.multiselect(
         "客户分层",
-        segments,
-        default=segments,
-        placeholder="请选择客户分层",
-        key="rfm_segments",
+        available_segments,
+        default=available_segments,
+        placeholder="选择需要查看的客户分层",
     )
 
-    segment_summary = (
-        rfm_customers.groupby("客户分层", as_index=False)
-        .agg(
-            客户人数=("user_id", "count"),
-            平均净消费=("Monetary", "mean"),
-        )
-        .round({"平均净消费": 2})
-    )
-    if segment_summary.empty:
-        st.info("当前城市筛选下没有可分析的客户。")
-    else:
-        segment_summary["客户占比"] = (
-            segment_summary["客户人数"] / segment_summary["客户人数"].sum()
-        )
-        segment_chart = px.treemap(
-            segment_summary,
-            path=["客户分层"],
-            values="客户人数",
-            color="平均净消费",
-            color_continuous_scale="Blues",
-            custom_data=["客户人数", "客户占比", "平均净消费"],
-        )
-        segment_chart.update_traces(
-            texttemplate="%{label}<br>%{customdata[0]} 人（%{customdata[1]:.1%}）<br>平均净消费 ¥%{customdata[2]:,.2f}",
-            hovertemplate=(
-                "%{label}<br>客户人数：%{customdata[0]}"
-                "<br>客户占比：%{customdata[1]:.1%}"
-                "<br>平均净消费：¥%{customdata[2]:,.2f}<extra></extra>"
-            ),
-        )
-        segment_chart.update_layout(
-            coloraxis_colorbar_title="平均净消费（元）",
-            margin=dict(t=10, l=0, r=0, b=0),
-        )
-        st.plotly_chart(segment_chart, width="stretch")
-
-    selected_customers = rfm_customers[
+    filtered_rfm = rfm_customers[
         rfm_customers["客户分层"].isin(selected_segments)
     ].copy()
-    customer_details = (
-        selected_customers.rename(
-            columns={
-                "Recency": "最近消费间隔天数",
-                "Frequency": "下单次数",
-                "Monetary": "净消费总额",
-            }
-        )[
-            [
-                "user_id",
-                "name",
-                "city",
-                "最近消费间隔天数",
-                "下单次数",
-                "净消费总额",
-                "客户分层",
-            ]
-        ]
-        .sort_values("净消费总额", ascending=False)
-    )
-    st.subheader("核心客户明细")
-    st.download_button(
-        "导出运营名单 CSV",
-        data=customer_details.to_csv(index=False).encode("utf-8-sig"),
-        file_name="rfm_customer_list.csv",
-        mime="text/csv",
-        key="download_rfm_customers",
-    )
-    st.dataframe(customer_details, width="stretch", hide_index=True)
+
+    if filtered_rfm.empty:
+      st.info("当前筛选条件下没有符合的客户。")
+    else:
+      segment_summary = (
+          filtered_rfm.groupby("客户分层", as_index=False)
+          .agg(
+              客户人数=("user_id", "count"),
+              平均净消费=("Monetary", "mean"),
+          )
+          .sort_values("客户人数", ascending=False)
+      )
+      total_rfm_users = segment_summary["客户人数"].sum()
+      segment_summary["人数占比"] = (
+          segment_summary["客户人数"] / total_rfm_users * 100
+      )
+      segment_summary["平均净消费"] = segment_summary["平均净消费"].round(2)
+
+      # 优化点：使用 uniformtext 统一字号，防止小格子文字缩成蚂蚁大小；同时优化鼠标悬停提示
+      treemap_chart = px.treemap(
+          segment_summary,
+          path=["客户分层"],
+          values="客户人数",
+          color="平均净消费",
+          color_continuous_scale="Blues",
+          custom_data=["人数占比", "平均净消费"],
+          labels={"平均净消费": "平均净消费（元）"},
+      )
+      treemap_chart.update_traces(
+          texttemplate=(
+              "<b>%{label}</b><br>%{value} 人"
+              " (%{customdata[0]:.1f}%)<br>平均净消费 ¥%{customdata[1]:,.2f}"
+          ),
+          hovertemplate=(
+              "<b>%{label}</b><br>客户人数：%{value} 人"
+              " (%{customdata[0]:.1f}%)<br>平均净消费："
+              " ¥%{customdata[1]:,.2f}<extra></extra>"
+          ),
+          textfont=dict(size=14),
+      )
+      treemap_chart.update_layout(
+          height=520,
+          margin=dict(t=20, l=10, r=10, b=10),
+          uniformtext=dict(minsize=13, mode="hide"),
+      )
+      st.plotly_chart(treemap_chart, width="stretch")
+
+      st.subheader("分层客户运营名单")
+      export_rfm = filtered_rfm[[
+          "user_id",
+          "name",
+          "city",
+          "Recency",
+          "Frequency",
+          "Monetary",
+          "客户分层",
+      ]].sort_values(by="Monetary", ascending=False)
+
+      st.download_button(
+          "导出运营名单 CSV",
+          data=export_rfm.to_csv(index=False).encode("utf-8-sig"),
+          file_name="rfm_customers.csv",
+          mime="text/csv",
+      )
+      st.dataframe(
+          export_rfm,
+          width="stretch",
+          hide_index=True,
+          column_config={
+              "user_id": st.column_config.NumberColumn("用户编号", width="small"),
+              "name": st.column_config.TextColumn("用户姓名", width="small"),
+              "city": st.column_config.TextColumn("所在城市", width="small"),
+              "Recency": st.column_config.NumberColumn(
+                  "最近消费间隔(天)", width="small"
+              ),
+              "Frequency": st.column_config.NumberColumn(
+                  "下单次数", width="small"
+              ),
+              "Monetary": st.column_config.NumberColumn(
+                  "净消费总额", format="¥%.2f", width="small"
+              ),
+              "客户分层": st.column_config.TextColumn("客户分层", width="large"),
+          },
+      )
