@@ -24,9 +24,13 @@ def load_orders() -> pd.DataFrame:
             orders.product_name,
             orders.category,
             orders.amount,
-            orders.order_date
+            orders.order_date,
+            COALESCE(refunds.refund_amount, 0) AS refund_amount,
+            refunds.reason AS refund_reason,
+            refunds.order_id IS NOT NULL AS has_refund
         FROM orders
         LEFT JOIN users ON orders.user_id = users.user_id
+        LEFT JOIN refunds ON orders.order_id = refunds.order_id
     """
     with closing(sqlite3.connect(DATABASE_PATH)) as connection:
         return pd.read_sql_query(query, connection)
@@ -57,11 +61,15 @@ if selected_cities:
 total_sales = filtered_orders["amount"].sum()
 order_count = len(filtered_orders)
 average_order_value = total_sales / order_count if order_count else 0
+total_refunds = filtered_orders["refund_amount"].sum()
+net_sales = total_sales - total_refunds
 
-metric_columns = st.columns(3)
+metric_columns = st.columns(5)
 metric_columns[0].metric("总销售额", f"¥{total_sales:,.2f}")
 metric_columns[1].metric("总订单数", f"{order_count:,}")
 metric_columns[2].metric("平均客单价", f"¥{average_order_value:,.2f}")
+metric_columns[3].metric("总退款金额", f"¥{total_refunds:,.2f}")
+metric_columns[4].metric("净销售额", f"¥{net_sales:,.2f}")
 
 chart_columns = st.columns(2)
 with chart_columns[0]:
@@ -115,6 +123,32 @@ with chart_columns[1]:
         weekly_chart.update_layout(xaxis_title=None, yaxis_title="销售额")
         st.plotly_chart(weekly_chart, width="stretch")
 
+st.subheader("退款原因分布")
+refunded_orders = filtered_orders[filtered_orders["has_refund"].astype(bool)].copy()
+if refunded_orders.empty:
+    st.info("当前筛选条件下没有退款记录。")
+else:
+    refunded_orders["refund_reason"] = refunded_orders["refund_reason"].fillna(
+        "未填写原因"
+    )
+    refund_reasons = (
+        refunded_orders.groupby("refund_reason", as_index=False)
+        .size()
+        .rename(columns={"size": "refund_count"})
+        .sort_values("refund_count", ascending=False)
+    )
+    refund_chart = px.pie(
+        refund_reasons,
+        names="refund_reason",
+        values="refund_count",
+        labels={"refund_reason": "退款原因", "refund_count": "退款订单数"},
+        hole=0.35,
+    )
+    refund_chart.update_traces(
+        hovertemplate="%{label}<br>退款订单数：%{value}<extra></extra>"
+    )
+    st.plotly_chart(refund_chart, width="stretch")
+
 st.subheader("消费总额 Top 10 用户排行榜")
 if filtered_orders.empty:
     st.info("当前筛选条件下没有订单。")
@@ -162,5 +196,8 @@ st.dataframe(
         "category": "商品类别",
         "amount": st.column_config.NumberColumn("订单金额", format="¥%.2f"),
         "order_date": "下单日期",
+        "refund_amount": st.column_config.NumberColumn("退款金额", format="¥%.2f"),
+        "refund_reason": "退款原因",
+        "has_refund": "是否退款",
     },
 )
