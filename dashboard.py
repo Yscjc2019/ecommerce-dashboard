@@ -297,7 +297,7 @@ with rfm_tab:
               客户人数=("user_id", "count"),
               平均净消费=("Monetary", "mean"),
           )
-          .sort_values("客户人数", ascending=False)
+          .sort_values("客户人数", ascending=True)  # 升序排列，让人数最多的排在最上方
       )
       total_rfm_users = segment_summary["客户人数"].sum()
       segment_summary["人数占比"] = (
@@ -305,34 +305,53 @@ with rfm_tab:
       )
       segment_summary["平均净消费"] = segment_summary["平均净消费"].round(2)
 
-      # 优化点：使用 uniformtext 统一字号，防止小格子文字缩成蚂蚁大小；同时优化鼠标悬停提示
-      treemap_chart = px.treemap(
+      # 组合一行简洁清晰的外部标签，适配电脑与手机屏幕
+      segment_summary["展示标签"] = segment_summary.apply(
+          lambda r: (
+              f"{int(r['客户人数'])}人 ({r['人数占比']:.1f}%) | 均消"
+              f" ¥{r['平均净消费']:,.0f}"
+          ),
+          axis=1,
+      )
+
+      bar_chart = px.bar(
           segment_summary,
-          path=["客户分层"],
-          values="客户人数",
+          x="客户人数",
+          y="客户分层",
+          orientation="h",
           color="平均净消费",
           color_continuous_scale="Blues",
+          text="展示标签",
           custom_data=["人数占比", "平均净消费"],
-          labels={"平均净消费": "平均净消费（元）"},
+          labels={
+              "客户人数": "客户人数（人）",
+              "客户分层": "",
+              "平均净消费": "平均净消费（元）",
+          },
       )
-      treemap_chart.update_traces(
-          texttemplate=(
-              "<b>%{label}</b><br>%{value} 人"
-              " (%{customdata[0]:.1f}%)<br>平均净消费 ¥%{customdata[1]:,.2f}"
-          ),
+
+      # 留出右侧充足空白，确保最短柱子右侧的文字也能完整展示不被截断
+      max_count = segment_summary["客户人数"].max()
+      bar_chart.update_traces(
+          textposition="outside",
+          cliponaxis=False,
+          textfont=dict(size=13),
           hovertemplate=(
-              "<b>%{label}</b><br>客户人数：%{value} 人"
-              " (%{customdata[0]:.1f}%)<br>平均净消费："
-              " ¥%{customdata[1]:,.2f}<extra></extra>"
+              "<b>%{y}</b><br>客户人数：%{x} 人"
+              " (%{customdata:.1f}%)<br>平均净消费："
+              " ¥%{customdata:,.2f}<extra></extra>"
           ),
-          textfont=dict(size=14),
       )
-      treemap_chart.update_layout(
-          height=520,
-          margin=dict(t=20, l=10, r=10, b=10),
-          uniformtext=dict(minsize=13, mode="hide"),
+      bar_chart.update_layout(
+          height=max(380, len(segment_summary) * 52),  # 根据类别数量动态调整高度，手机端不拥挤
+          xaxis=dict(range=[0, max_count * 1.48], title="客户人数（人）"),
+          yaxis=dict(tickfont=dict(size=13)),
+          margin=dict(t=20, l=10, r=20, b=30),
+          coloraxis_colorbar=dict(
+              orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1
+          ),  # 色条放顶部水平展示，省出手机端左右宽度
       )
-      st.plotly_chart(treemap_chart, width="stretch")
+      st.plotly_chart(bar_chart, width="stretch")
 
       st.subheader("分层客户运营名单")
       export_rfm = filtered_rfm[[
