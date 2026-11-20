@@ -183,13 +183,15 @@ st.download_button(
     file_name="filtered_orders.csv",
     mime="text/csv",
 )
+display_orders = filtered_orders.copy()
+display_orders["refund_reason"] = display_orders["refund_reason"].fillna("-")
 st.dataframe(
-    filtered_orders,
+    display_orders,
     width="stretch",
     hide_index=True,
     column_config={
-        "order_id": "订单编号",
-        "user_id": "用户编号",
+        "order_id": st.column_config.NumberColumn("订单编号", width="small"),
+        "user_id": st.column_config.NumberColumn("用户编号", width="small"),
         "name": "用户姓名",
         "city": "城市",
         "product_name": "商品名称",
@@ -197,7 +199,7 @@ st.dataframe(
         "amount": st.column_config.NumberColumn("订单金额", format="¥%.2f"),
         "order_date": "下单日期",
         "refund_amount": st.column_config.NumberColumn("退款金额", format="¥%.2f"),
-        "refund_reason": "退款原因",
-        "has_refund": "是否退款",
+        "refund_reason": st.column_config.TextColumn("退款原因", width="large"),
+        "has_refund": st.column_config.NumberColumn("是否退款", width="small"),
     },
 )
