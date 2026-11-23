@@ -74,13 +74,10 @@ def save_milk_record_and_sync(
   """将网页提交的牛奶采价或下架记录写入本地 shop.db，并通过 GitHub API 同步持久化到仓库"""
   now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
   if is_delisted:
-    dt_obj = datetime.strptime(record_date, "%Y-%m-%d")
     status_val = "已下架"
     price_val = None
-    fb_val = (
-        f"{dt_obj.year}年{dt_obj.month}月{dt_obj.day}日该产品已下架（反馈："
-        f"{feedback or '货架已清空'}）"
-    )
+    # 精简冗余前缀，避免表格列宽溢出（日期和状态在独立列中已有清晰展示）
+    fb_val = feedback.strip() if feedback.strip() else "货架已清空"
   else:
     status_val = "在售"
     price_val = round(float(price), 2)
