@@ -159,99 +159,161 @@ def save_milk_record_and_sync(
 
 
 def retrieve_rag_context(
+    question: str,
     orders_df: pd.DataFrame,
     rfm_df: pd.DataFrame,
     gold_df: pd.DataFrame,
     milk_df: pd.DataFrame,
-) -> str:
-  """RAG 检索阶段（Retrieval）：从多张数据库表中提取最新统计摘要作为私有知识库上下文"""
-  total_sales = orders_df["amount"].sum()
-  net_sales = total_sales - orders_df["refund_amount"].sum()
-  top_cat = (
-      orders_df.groupby("category")["amount"].sum().idxmax()
-      if not orders_df.empty
-      else "无"
-  )
-  vip_count = len(rfm_df[rfm_df["客户分层"] == "重要价值客户（核心金主）"])
+) -> dict:
+    """增强版 RAG 检索器：从数据库动态提取多维度业务切片，同时返回文本上下文与结构化指标"""
+    total_sales = orders_df["amount"].sum()
+    total_refund = orders_df["refund_amount"].sum()
+    net_sales = total_sales - total_refund
+    refund_rate = (total_refund / total_sales * 100) if total_sales else 0
 
-  gold_summary = "暂无黄金行情数据。"
-  if not gold_df.empty:
-    latest_g = gold_df.iloc[-1]
-    min_g = gold_df["price_cny_g"].min()
-    max_g = gold_df["price_cny_g"].max()
-    gold_summary = (
-        f"近30天黄金价格区间为 ¥{min_g:.2f}/克 ~ ¥{max_g:.2f}/克，"
-        f"最新（{latest_g['record_date']}）价格为 ¥{latest_g['price_cny_g']:.2f}/克。"
+    # 1. 品类与城市切片
+    cat_stats = (
+        orders_df.groupby("category", as_index=False)
+        .agg(销售额=("amount", "sum"), 退款额=("refund_amount", "sum"))
+        .assign(净销售额=lambda d: d["销售额"] - d["退款额"])
+        .sort_values("净销售额", ascending=False)
+    )
+    city_stats = (
+        orders_df.groupby("city", as_index=False)
+        .agg(销售额=("amount", "sum"), 退款额=("refund_amount", "sum"))
+        .assign(退款率=lambda d: (d["退款额"] / d["销售额"] * 100).round(1))
+        .sort_values("销售额", ascending=False)
     )
 
-  milk_summary = "暂无牛奶采价记录。"
-  if not milk_df.empty:
-    records_str = "；".join([
-        f"{r['record_date']}: 状态[{r['status']}], 价格[{r['price'] if pd.notna(r['price']) else '无'}], 备注[{r['feedback']}]"
-        for _, r in milk_df.iterrows()
-    ])
-    milk_summary = f"牛奶采价历史明细：{records_str}"
+    # 2. RFM 客户分层切片
+    seg_counts = rfm_df["客户分层"].value_counts().to_dict()
+    top_vips = (
+        rfm_df[rfm_df["客户分层"] == "重要价值客户（核心金主）"]
+        .sort_values("Monetary", ascending=False)
+        .head(3)
+    )
+    vip_names = (
+        "、".join([f"{r['name']}({r['city']}, ¥{r['Monetary']:,.0f})" for _, r in top_vips.iterrows()])
+        if not top_vips.empty
+        else "暂无"
+    )
 
-  return (
-      "【私有数据库实时检索上下文】\n"
-      f"1. 电商经营概况：总销售额 ¥{total_sales:,.2f}，净销售额 ¥{net_sales:,.2f}，销售额最高品类为【{top_cat}】，核心金主客户共 {vip_count} 人。\n"
-      f"2. 黄金行情监控：{gold_summary}\n"
-      f"3. 牛奶巡检监控：{milk_summary}\n"
-  )
+    # 3. 黄金与牛奶实时切片
+    gold_text = "暂无黄金行情数据。"
+    if not gold_df.empty:
+        max_row = gold_df.loc[gold_df["price_cny_g"].idxmax()]
+        min_row = gold_df.loc[gold_df["price_cny_g"].idxmin()]
+        latest_row = gold_df.iloc[-1]
+        gold_text = (
+            f"最新({latest_row['record_date']}) ¥{latest_row['price_cny_g']:.2f}/克；"
+            f"近30日最高 ¥{max_row['price_cny_g']:.2f}/克({max_row['record_date']})，"
+            f"最低 ¥{min_row['price_cny_g']:.2f}/克({min_row['record_date']})。"
+        )
+
+    milk_text = "暂无牛奶采价记录。"
+    if not milk_df.empty:
+        valid_p = milk_df.dropna(subset=["price"])
+        avg_p = f"在售均价 ¥{valid_p['price'].mean():.2f}" if not valid_p.empty else "暂无有效报价"
+        delisted_days = milk_df[milk_df["status"] == "已下架"]["record_date"].tolist()
+        delisted_str = f"曾于 {', '.join(delisted_days)} 发生下架" if delisted_days else "近期无下架记录"
+        detail_items = []
+        for _, r in milk_df.iterrows():
+          price_str = f"¥{r['price']:.2f}" if pd.notna(r["price"]) else "无报价"
+          detail_items.append(
+              f"{r['record_date']}[{r['status']}]{price_str}({r['feedback']})"
+          )
+        details = " | ".join(detail_items)
+        milk_text = f"{avg_p}；{delisted_str}。完整记录：{details}"
+
+    context_str = (
+        f"【1. 经营总览】总销售额 ¥{total_sales:,.2f}，总退款 ¥{total_refund:,.2f}（退款率 {refund_rate:.1f}%），净销售额 ¥{net_sales:,.2f}。\n"
+        f"【2. 品类表现】" + "；".join([f"{r['category']}: 净销¥{r['净销售额']:,.0f}" for _, r in cat_stats.iterrows()]) + "。\n"
+        f"【3. 城市表现】Top3城市为 " + "；".join([f"{r['city']}(销售¥{r['销售额']:,.0f}, 退款率{r['退款率']}%)" for _, r in city_stats.head(3).iterrows()]) + "。\n"
+        f"【4. 客户分层】总客户 {len(rfm_df)} 人，分布：{seg_counts}。Top3核心金主：{vip_names}。\n"
+        f"【5. 黄金行情】{gold_text}\n"
+        f"【6. 牛奶监控】{milk_text}"
+    )
+
+    return {
+        "context_str": context_str,
+        "gold_text": gold_text,
+        "milk_text": milk_text,
+        "vip_names": vip_names,
+        "seg_counts": seg_counts,
+        "cat_stats": cat_stats,
+        "city_stats": city_stats,
+        "net_sales": net_sales,
+        "refund_rate": refund_rate,
+    }
 
 
 def generate_rag_answer(
-    question: str, context: str, api_key: str, base_url: str, model_name: str
+    question: str,
+    chat_history: list[dict],
+    rag_bundle: dict,
+    api_key: str,
+    base_url: str,
+    model_name: str,
 ) -> str:
-  """RAG 生成阶段（Generation）：结合检索到的私有数据库上下文回答用户提问"""
-  if api_key.strip():
-    try:
-      headers = {
-          "Authorization": f"Bearer {api_key.strip()}",
-          "Content-Type": "application/json",
-      }
-      payload = {
-          "model": model_name.strip() or "deepseek-chat",
-          "messages": [
-              {
-                  "role": "system",
-                  "content": (
-                      "你是一个严谨的商业数据分析助手。请严格基于以下【私有数据库实时检索上下文】回答用户的问题，给出具体数据支撑，不要编造上下文中不存在的数据：\n\n"
-                      + context
-                  ),
-              },
-              {"role": "user", "content": question},
-          ],
-          "temperature": 0.3,
-      }
-      resp = requests.post(
-          f"{base_url.rstrip('/')}/chat/completions",
-          headers=headers,
-          json=payload,
-          timeout=20,
-      )
-      resp.raise_for_status()
-      return resp.json()["choices"][0]["message"]["content"]
-    except Exception as e:
-      return f"⚠️ 大模型 API 调用失败（{e}），以下为您展示直接从数据库检索到的核心事实：\n\n{context}"
+    """增强版生成引擎：支持多轮对话上下文与智能规则推理"""
+    context = rag_bundle["context_str"]
+    if api_key.strip():
+        try:
+            headers = {
+                "Authorization": f"Bearer {api_key.strip()}",
+                "Content-Type": "application/json",
+            }
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是一位资深商业数据分析师。请严格基于以下【私有数据库实时检索切片】回答用户提问，"
+                        "结合具体数字给出简洁专业的结论与行动建议，切勿编造不存在的数据：\n\n" + context
+                    ),
+                }
+            ]
+            # 携带最近 4 轮对话记忆，支持连续追问
+            for msg in chat_history[-4:]:
+                messages.append({"role": msg["role"], "content": msg["content"]})
+            messages.append({"role": "user", "content": question})
 
-  # 未填写 API Key 时的本地智能检索兜底引擎（开箱即用）
-  q = question.lower()
-  if "牛奶" in q or "下架" in q:
-    return (
-        "📊 **基于 `milk_prices` 表的实时检索结果：**\n\n"
-        + context.split("3. 牛奶巡检监控：")[1]
-        + "\n\n💡 *提示：在左侧边栏填入大模型 API Key 后，我还可以为你进行更深度的消费趋势推理。*"
-    )
-  if "黄金" in q or "金价" in q:
-    return (
-        "📊 **基于 `gold_prices` 表的实时检索结果：**\n\n"
-        + context.split("2. 黄金行情监控：")[1].split("3. 牛奶巡检监控：")[0]
-    )
-  return (
-      "📊 **已为您从 `shop.db` 多张业务表中检索到以下实时数据摘要：**\n\n"
-      + context
-  )
+            resp = requests.post(
+                f"{base_url.rstrip('/')}/chat/completions",
+                headers=headers,
+                json={
+                    "model": model_name.strip() or "deepseek-chat",
+                    "messages": messages,
+                    "temperature": 0.3,
+                },
+                timeout=25,
+            )
+            resp.raise_for_status()
+            return resp.json()["choices"]["message"]["content"]
+        except Exception as e:
+            return f"⚠️ 大模型接口调用异常（`{e}`），已为您切换至本地实时检索结果：\n\n{context}"
+
+    # 零 API Key 时的本地多意图智能分析引擎
+    q = question.lower()
+    if any(k in q for k in ["牛奶", "下架", "采价"]):
+        return f"🥛 **牛奶采价与状态诊断**\n\n- **核心结论**：{rag_bundle['milk_text']}\n- **运营建议**：建议重点关注下架后的补货恢复时间，若连续 3 天缺货需及时排查供应链或切换竞品监控。"
+    if any(k in q for k in ["黄金", "金价", "贵金属"]):
+        return f"🟡 **黄金行情趋势分析**\n\n- **区间表现**：{rag_bundle['gold_text']}\n- **观察提示**：当前数据已接入 GitHub Actions 每日自动更新管道，可结合近 30 日低点评估阶段性配置窗口。"
+    if any(k in q for k in ["客户", "金主", "rfm", "流失", "用户"]):
+        return (
+            f"💎 **RFM 客户价值分层洞察**\n\n"
+            f"- **高价值核心金主 Top 3**：{rag_bundle['vip_names']}\n"
+            f"- **人群结构分布**：{rag_bundle['seg_counts']}\n"
+            f"- **行动建议**：建议优先针对“重要唤回客户”与“重要挽留客户”导出名单发放定向唤醒券。"
+        )
+    if any(k in q for k in ["城市", "品类", "销售", "退款", "退货", "经营"]):
+        top_city = rag_bundle["city_stats"].iloc[0]
+        top_cat = rag_bundle["cat_stats"].iloc[0]
+        return (
+            f"📊 **全链路经营与退货诊断**\n\n"
+            f"- **整体健康度**：当前累计净销售额 **¥{rag_bundle['net_sales']:,.2f}**，整体退款率为 **{rag_bundle['refund_rate']:.1f}%**。\n"
+            f"- **主力增长引擎**：【{top_cat['category']}】品类净贡献最高（¥{top_cat['净销售额']:,.0f}）；【{top_city['city']}】是销售额最高城市（退款率 {top_city['退款率']}%）。"
+        )
+    return f"📊 **已为您检索全库最新经营切片：**\n\n{context}\n\n💡 *你可以继续追问具体的**品类表现、城市退货率、核心金主名单、黄金高低点或牛奶下架记录**！*"
 
 
 def calculate_rfm(orders: pd.DataFrame) -> pd.DataFrame:
@@ -750,32 +812,70 @@ with monitor_tab:
   st.divider()
   st.subheader("🤖 私有数据 RAG 智能分析助手")
   st.caption(
-      "系统会自动从 SQLite"
-      " 数据库检索最新销售、退款、RFM"
-      " 分层、黄金与牛奶状态数据作为知识库上下文进行回答。"
+      "支持多轮连续追问与一键业务诊断（填 API Key 可调用大模型深度推理，不填也可使用内置多意图检索引擎）。"
   )
 
-  with st.expander(
-      "⚙️ 大模型 API 配置（可选：不填也可使用内置检索分析引擎）"
-  ):
+  with st.expander("⚙️ 大模型 API 配置（可选）", expanded=False):
     c1, c2, c3 = st.columns(3)
     rag_api_key = c1.text_input("API Key", type="password", placeholder="sk-...")
-    # 修正：DeepSeek 兼容 OpenAI 协议，接口前缀必须带 api.
-    rag_base_url = c2.text_input("Base URL", value="https://api.deepseek.com")
+    rag_base_url = c2.text_input("Base URL", value="https://deepseek.com")
     rag_model = c3.text_input("模型名称", value="deepseek-chat")
 
-  user_q = st.text_input(
-      "向你的专属数据库提问：",
-      placeholder="例如：最近牛奶有没有下架记录？近30天黄金价格最高是多少？",
+  # 初始化对话历史
+  if "rag_messages" not in st.session_state:
+    st.session_state.rag_messages = [{
+        "role": "assistant",
+        "content": (
+            "你好！我是你的专属商业数据分析助手。你可以点击下方快捷按钮，或直接输入问题向数据库提问："
+        ),
+    }]
+
+  # 快捷提问按钮栏（点一下直接提问，不用手动打字）
+  q_cols = st.columns(4)
+  quick_prompts = [
+      ("📊 整体经营与退货诊断", "请帮我诊断当前的整体销售、净销售额和退货表现"),
+      ("💎 核心金主与客户分布", "目前有多少核心金主？客户分层分布如何？"),
+      ("🟡 黄金近30日高低点", "近30天黄金价格最高和最低分别是多少？"),
+      ("🥛 牛奶采价与下架复盘", "汇总一下牛奶的采价均价和下架记录"),
+  ]
+  triggered_prompt = None
+  for idx, (btn_label, prompt_text) in enumerate(quick_prompts):
+    if q_cols[idx].button(btn_label, use_container_width=True):
+      triggered_prompt = prompt_text
+
+  # 渲染历史对话气泡
+  for msg in st.session_state.rag_messages:
+    with st.chat_message(msg["role"]):
+      st.markdown(msg["content"])
+
+  # 接收快捷按钮或输入框提问
+  chat_input_text = st.chat_input(
+      "输入问题，例如：哪个城市销售额最高？牛奶最近下架过吗？"
   )
-  if user_q:
-    rag_context = retrieve_rag_context(
-        orders, rfm_customers, gold_prices, milk_prices
+  final_question = triggered_prompt or chat_input_text
+
+  if final_question:
+    st.session_state.rag_messages.append(
+        {"role": "user", "content": final_question}
     )
-    with st.spinner("正在检索数据库并生成分析..."):
-      answer = generate_rag_answer(
-          user_q, rag_context, rag_api_key, rag_base_url, rag_model
-      )
-    st.markdown(answer)
-    with st.expander("🔍 查看底层检索到的数据库上下文（RAG Retrieval Evidence）"):
-      st.text(rag_context)
+    with st.chat_message("user"):
+      st.markdown(final_question)
+
+    rag_bundle = retrieve_rag_context(
+        final_question, orders, rfm_customers, gold_prices, milk_prices
+    )
+    with st.chat_message("assistant"):
+      with st.spinner("正在检索多表数据并生成分析..."):
+        reply = generate_rag_answer(
+            final_question,
+            st.session_state.rag_messages[:-1],
+            rag_bundle,
+            rag_api_key,
+            rag_base_url,
+            rag_model,
+        )
+      st.markdown(reply)
+      with st.expander("🔍 查看底层检索到的数据库上下文"):
+        st.text(rag_bundle["context_str"])
+
+    st.session_state.rag_messages.append({"role": "assistant", "content": reply})
