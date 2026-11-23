@@ -1,5 +1,7 @@
+import base64
 import sqlite3
 from contextlib import closing
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -38,6 +40,7 @@ def load_orders() -> pd.DataFrame:
     with closing(sqlite3.connect(DATABASE_PATH)) as connection:
         return pd.read_sql_query(query, connection)
 
+
 @st.cache_data(ttl=60)
 def load_price_monitors() -> tuple[pd.DataFrame, pd.DataFrame]:
   """从 shop.db 读取黄金行情与牛奶巡检记录"""
@@ -63,6 +66,99 @@ def load_price_monitors() -> tuple[pd.DataFrame, pd.DataFrame]:
         else pd.DataFrame()
     )
   return gold_df, milk_df
+
+
+def save_milk_record_and_sync(
+    record_date: str, product_name: str, is_delisted: bool, price: float, feedback: str
+) -> tuple[bool, str]:
+  """将网页提交的牛奶采价或下架记录写入本地 shop.db，并通过 GitHub API 同步持久化到仓库"""
+  now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+  if is_delisted:
+    dt_obj = datetime.strptime(record_date, "%Y-%m-%d")
+    status_val = "已下架"
+    price_val = None
+    fb_val = (
+        f"{dt_obj.year}年{dt_obj.month}月{dt_obj.day}日该产品已下架（反馈："
+        f"{feedback or '货架已清空'}）"
+    )
+  else:
+    status_val = "在售"
+    price_val = round(float(price), 2)
+    fb_val = feedback.strip() if feedback.strip() else "正常在售"
+
+  # 1. 写入本地 SQLite 数据库（含自动字段迁移，兼容旧版表结构）
+  with closing(sqlite3.connect(DATABASE_PATH)) as conn:
+    conn.execute("""
+          CREATE TABLE IF NOT EXISTS milk_prices (
+              record_date TEXT PRIMARY KEY,
+              product_name TEXT,
+              price REAL,
+              status TEXT,
+              feedback TEXT,
+              updated_at TEXT
+          )
+      """)
+    existing_cols = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(milk_prices)").fetchall()
+    }
+    if "product_name" not in existing_cols:
+      conn.execute(
+          "ALTER TABLE milk_prices ADD COLUMN product_name TEXT DEFAULT"
+          " '某品牌鲜牛奶 950ml'"
+      )
+    if "updated_at" not in existing_cols:
+      conn.execute("ALTER TABLE milk_prices ADD COLUMN updated_at TEXT")
+
+    conn.execute(
+        """
+          INSERT OR REPLACE INTO milk_prices
+          (record_date, product_name, price, status, feedback, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?)
+          """,
+        (record_date, product_name, price_val, status_val, fb_val, now_str),
+    )
+    conn.commit()
+
+  # 2. 如果配置了 GITHUB_TOKEN（云端环境），自动将最新 shop.db 推送回 GitHub 仓库防止休眠丢失
+  gh_token = ""
+  gh_repo = "Yscjc2019/ecommerce-dashboard"
+  try:
+    gh_token = st.secrets.get("GITHUB_TOKEN", "")
+    gh_repo = st.secrets.get("GITHUB_REPO", gh_repo)
+  except Exception:
+    # 本地无 secrets.toml 或云端未配置时静默降级为仅本地保存
+    pass
+
+  if not gh_token:
+    return True, "已保存到本地数据库（未检测到云端 GITHUB_TOKEN，仅本地生效）。"
+
+  try:
+    api_url = f"https://api.github.com/repos/{gh_repo}/contents/shop.db"
+    headers = {
+        "Authorization": f"Bearer {gh_token}",
+        "Accept": "application/vnd.github+json",
+    }
+    # 获取当前仓库中 shop.db 的最新 sha 值（GitHub API 更新文件必需）
+    get_resp = requests.get(api_url, headers=headers, timeout=15)
+    get_resp.raise_for_status()
+    file_sha = get_resp.json()["sha"]
+
+    # 读取刚更新完的本地 shop.db 并编码为 base64 上传
+    db_bytes = DATABASE_PATH.read_bytes()
+    encoded_content = base64.b64encode(db_bytes).decode("utf-8")
+
+    put_payload = {
+        "message": f"chore: 在线录入 {record_date} 牛奶采价状态 ({status_val})",
+        "content": encoded_content,
+        "sha": file_sha,
+        "branch": "main",
+    }
+    put_resp = requests.put(api_url, headers=headers, json=put_payload, timeout=20)
+    put_resp.raise_for_status()
+    return True, "✅ 已成功入库并自动同步备份至 GitHub 云端仓库！"
+  except Exception as e:
+    return False, f"⚠️ 本地已写入，但同步 GitHub 失败：{e}"
 
 
 def retrieve_rag_context(
@@ -159,7 +255,6 @@ def generate_rag_answer(
       "📊 **已为您从 `shop.db` 多张业务表中检索到以下实时数据摘要：**\n\n"
       + context
   )
-
 
 
 def calculate_rfm(orders: pd.DataFrame) -> pd.DataFrame:
@@ -447,7 +542,7 @@ with rfm_tab:
           y="客户分层",
           orientation="h",
           color="平均净消费",
-          # 替换为从清晰中浅蓝到深蓝的渐变，彻底告别“白底隐身”
+          # 从浅蓝到深蓝的渐变，彻底告别“白底隐身”
           color_continuous_scale=["#93C5FD", "#3B82F6", "#1D4ED8", "#1E3A8A"],
           text="展示标签",
           custom_data=["人数占比", "平均净消费"],
@@ -459,6 +554,7 @@ with rfm_tab:
       )
 
       max_count = segment_summary["客户人数"].max()
+      # 只调用一次 update_traces，保留柱子的细边框与富文本标签
       bar_chart.update_traces(
           textposition="outside",
           cliponaxis=False,
@@ -466,19 +562,6 @@ with rfm_tab:
           marker_line=dict(
               color="#64748B", width=0.8
           ),  # 给柱子加上极细边框，边界更锐利
-          hovertemplate=(
-              "<b>%{y}</b><br>客户人数：%{x} 人"
-              " (%{customdata:.1f}%)<br>平均净消费："
-              " ¥%{customdata:,.2f}<extra></extra>"
-          ),
-      )
-
-      # 留出右侧充足空白，确保最短柱子右侧的文字也能完整展示不被截断
-      max_count = segment_summary["客户人数"].max()
-      bar_chart.update_traces(
-          textposition="outside",
-          cliponaxis=False,
-          textfont=dict(size=13),
           hovertemplate=(
               "<b>%{y}</b><br>客户人数：%{x} 人"
               " (%{customdata:.1f}%)<br>平均净消费："
@@ -535,6 +618,11 @@ with rfm_tab:
       )
 
 with monitor_tab:
+  # 展示上一次提交成功后 rerun 保留的 flash 消息（展示一次即清空）
+  flash_msg = st.session_state.pop("milk_flash_msg", None)
+  if flash_msg:
+    st.success(flash_msg)
+
   st.subheader("双轨商品价格与状态监控中心")
   p_col1, p_col2 = st.columns(2)
 
@@ -568,6 +656,36 @@ with monitor_tab:
 
   with p_col2:
     st.markdown("#### 🥛 路线二：牛奶人工采价与下架状态闭环")
+
+    with st.expander("📝 在线录入今日牛奶价格 / 下架反馈", expanded=False):
+      with st.form("milk_entry_form", clear_on_submit=False):
+        f_date = st.date_input("记录日期", value=datetime.now().date())
+        f_product = st.text_input("商品名称", value="某品牌鲜牛奶 950ml")
+        f_delisted = st.checkbox("🚨 该产品已下架（勾选后无需填写价格）")
+        f_price = st.number_input(
+            "当前售价（元）", min_value=0.0, value=19.9, step=0.1
+        )
+        f_feedback = st.text_input(
+            "状态或下架原因备注",
+            placeholder="例如：正常在售 / 周末促销 / 货架已清空",
+        )
+        submitted = st.form_submit_button("提交并同步至云端数据库")
+
+        if submitted:
+          ok, msg = save_milk_record_and_sync(
+              f_date.strftime("%Y-%m-%d"),
+              f_product,
+              f_delisted,
+              f_price,
+              f_feedback,
+          )
+          if ok:
+            st.session_state["milk_flash_msg"] = msg  # flash：rerun 后在 monitor_tab 顶部展示
+            st.cache_data.clear()  # 清除缓存使页面图表立刻刷新出最新数据
+            st.rerun()
+          else:
+            st.warning(msg)
+
     if milk_prices.empty:
       st.info("暂无牛奶采价记录，请先运行 `milk_watchdog.py`。")
     else:
@@ -603,40 +721,44 @@ with monitor_tab:
         st.plotly_chart(m_chart, width="stretch")
 
       milk_display = milk_prices[[
-            "record_date",
-            "status",
-            "price",
-            "feedback",
-        ]].copy()
-      
-    st.dataframe(
-        milk_display,
-        width="stretch",
-        hide_index=True,
-        column_config={
-            "record_date": st.column_config.TextColumn(
-                "记录日期", width="small"
-            ),
-            "status": st.column_config.TextColumn("状态", width="small"),
-            "price": st.column_config.NumberColumn(
-                "价格", format="¥%.2f", width="small"
-            ),
-            "feedback": st.column_config.TextColumn(
-                "状态/下架反馈记录", width="large"
-            ),
-        },
-    )
+          "record_date",
+          "status",
+          "price",
+          "feedback",
+      ]].copy()
+      st.dataframe(
+          milk_display,
+          width="stretch",
+          hide_index=True,
+          column_config={
+              "record_date": st.column_config.TextColumn(
+                  "记录日期", width="small"
+              ),
+              "status": st.column_config.TextColumn("状态", width="small"),
+              "price": st.column_config.NumberColumn(
+                  "价格", format="¥%.2f", width="small"
+              ),
+              "feedback": st.column_config.TextColumn(
+                  "状态/下架反馈记录", width="large"
+              ),
+          },
+      )
 
   st.divider()
   st.subheader("🤖 私有数据 RAG 智能分析助手")
   st.caption(
-      "系统会自动从 SQLite 数据库检索最新销售、退款、RFM 分层、黄金与牛奶状态数据作为知识库上下文进行回答。"
+      "系统会自动从 SQLite"
+      " 数据库检索最新销售、退款、RFM"
+      " 分层、黄金与牛奶状态数据作为知识库上下文进行回答。"
   )
 
-  with st.expander("⚙️ 大模型 API 配置（可选：不填也可使用内置检索分析引擎）"):
+  with st.expander(
+      "⚙️ 大模型 API 配置（可选：不填也可使用内置检索分析引擎）"
+  ):
     c1, c2, c3 = st.columns(3)
     rag_api_key = c1.text_input("API Key", type="password", placeholder="sk-...")
-    rag_base_url = c2.text_input("Base URL", value="https://deepseek.com")
+    # 修正：DeepSeek 兼容 OpenAI 协议，接口前缀必须带 api.
+    rag_base_url = c2.text_input("Base URL", value="https://api.deepseek.com")
     rag_model = c3.text_input("模型名称", value="deepseek-chat")
 
   user_q = st.text_input(
