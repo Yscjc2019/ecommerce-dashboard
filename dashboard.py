@@ -723,6 +723,12 @@ with monitor_tab:
           "price",
           "feedback",
       ]].copy()
+      # 自动精简历史遗留的冗余前缀，让旧数据也清爽显示
+      milk_display["feedback"] = milk_display["feedback"].str.replace(
+          r"^\d{4}年\d{1,2}月\d{1,2}日该产品已下架（(?:原)?备注：(.*)）$",
+          r"\1",
+          regex=True,
+      )
       st.dataframe(
           milk_display,
           width="stretch",
@@ -736,7 +742,7 @@ with monitor_tab:
                   "价格", format="¥%.2f", width="small"
               ),
               "feedback": st.column_config.TextColumn(
-                  "状态/下架反馈记录", width="large"
+                  "状态/下架反馈记录", width="medium"
               ),
           },
       )
