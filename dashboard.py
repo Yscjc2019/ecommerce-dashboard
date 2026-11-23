@@ -7,6 +7,12 @@ from pathlib import Path
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from auth_rbac import (
+    ROLE_PERMISSIONS,
+    apply_row_level_security,
+    hash_password,
+    render_login_gate,
+)
 
 import os
 import requests
@@ -370,35 +376,81 @@ def calculate_rfm(orders: pd.DataFrame) -> pd.DataFrame:
 st.set_page_config(page_title="电商数据分析看板", page_icon="📊", layout="wide")
 st.title("电商数据分析看板")
 
-orders = load_orders()
+# 1. 启动企业级 RBAC 登录门禁（未登录时拦截后续所有业务代码渲染）
+current_user = render_login_gate()
+if not current_user:
+  st.stop()
+user_perms = current_user["perms"]
+
+# 2. 加载全量原始订单并立刻执行行级数据安全隔离（RLS：按角色限制城市与历史时间跨度）
+raw_orders = load_orders()
+orders = apply_row_level_security(raw_orders, current_user)
+
 categories = sorted(orders["category"].dropna().unique().tolist())
 cities = sorted(orders["city"].dropna().unique().tolist())
 
 with st.sidebar:
-    st.header("数据筛选")
-    selected_categories = st.multiselect("商品类别", categories, default=categories)
-    selected_cities = st.multiselect(
-        "城市",
-        cities,
-        default=[],
-        placeholder="留空表示全部城市",
-        help="不选择城市时展示全部城市的数据。",
-    )
+  # 侧边栏顶部身份卡片与角色切换入口
+  st.success(
+      f"👤 **{current_user['display_name']}**\n\n"
+      f"角色：`{user_perms['label']}`\n\n"
+      f"部门：{current_user['department']}"
+  )
+  if st.button("🚪 退出 / 切换角色", use_container_width=True):
+    st.session_state.current_user = None
+    st.session_state.pop("rag_messages", None)
+    st.rerun()
+
+  # 提示当前角色的数据权限范围
+  scope_city = (
+      "全部城市"
+      if user_perms["allowed_cities"] is None
+      else "、".join(user_perms["allowed_cities"])
+  )
+  scope_days = (
+      "全量历史"
+      if user_perms["max_days"] is None
+      else f"近 {user_perms['max_days']} 天"
+  )
+  st.caption(f"🔒 数据权限范围：{scope_city} | {scope_days}")
+  st.divider()
+
+  st.header("数据筛选")
+  selected_categories = st.multiselect(
+      "商品类别", categories, default=categories
+  )
+  selected_cities = st.multiselect(
+      "城市",
+      cities,
+      default=[],
+      placeholder="留空表示权限内全部城市",
+      help="仅展示当前角色权限范围内的城市。",
+  )
 
 filtered_orders = orders[orders["category"].isin(selected_categories)].copy()
 if selected_cities:
-    filtered_orders = filtered_orders[filtered_orders["city"].isin(selected_cities)]
+  filtered_orders = filtered_orders[
+      filtered_orders["city"].isin(selected_cities)
+  ]
 
-rfm_customers = calculate_rfm(orders)
-if selected_cities:
-    rfm_customers = rfm_customers[rfm_customers["city"].isin(selected_cities)].copy()
+rfm_customers = (
+    calculate_rfm(orders) if not orders.empty else pd.DataFrame()
+)
+if selected_cities and not rfm_customers.empty:
+  rfm_customers = rfm_customers[
+      rfm_customers["city"].isin(selected_cities)
+  ].copy()
 
 gold_prices, milk_prices = load_price_monitors()
-overview_tab, rfm_tab, monitor_tab = st.tabs(
-    ["📊 销售与退款总览", "💎 客户价值分层 (RFM)", "📈 价格监控与 AI 助手 (RAG)"]
-)
 
-with overview_tab:
+# 3. 动态标签页路由：严格按角色权限渲染可见模块（如一线专员看不到财务与RFM标签页）
+allowed_tabs = user_perms["tabs"]
+rendered_tabs = st.tabs(allowed_tabs)
+tab_map = dict(zip(allowed_tabs, rendered_tabs))
+
+if "📊 销售与退款总览" in tab_map:
+  with tab_map["📊 销售与退款总览"]:
+    # ...（原有 overview_tab 内部所有代码保持不变）...
     total_sales = filtered_orders["amount"].sum()
     order_count = len(filtered_orders)
     average_order_value = total_sales / order_count if order_count else 0
@@ -552,330 +604,426 @@ with overview_tab:
         },
     )
 
-with rfm_tab:
-  st.subheader("客户价值分层分布")
-  if rfm_customers.empty:
-    st.info("当前筛选条件下没有客户数据。")
-  else:
-    available_segments = sorted(rfm_customers["客户分层"].unique().tolist())
-    selected_segments = st.multiselect(
-        "客户分层",
-        available_segments,
-        default=available_segments,
-        placeholder="选择需要查看的客户分层",
-    )
+if "💎 客户价值分层 (RFM)" in tab_map:
+    with tab_map["💎 客户价值分层 (RFM)"]:
+        st.subheader("客户价值分层分布")
+        if rfm_customers.empty:
+            st.info("当前筛选条件下没有客户数据。")
+        else:
+            available_segments = sorted(rfm_customers["客户分层"].unique().tolist())
+            selected_segments = st.multiselect(
+                "客户分层",
+                available_segments,
+                default=available_segments,
+                placeholder="选择需要查看的客户分层",
+            )
 
-    filtered_rfm = rfm_customers[
-        rfm_customers["客户分层"].isin(selected_segments)
-    ].copy()
+            filtered_rfm = rfm_customers[
+                rfm_customers["客户分层"].isin(selected_segments)
+            ].copy()
 
-    if filtered_rfm.empty:
-      st.info("当前筛选条件下没有符合的客户。")
-    else:
-      segment_summary = (
-          filtered_rfm.groupby("客户分层", as_index=False)
-          .agg(
-              客户人数=("user_id", "count"),
-              平均净消费=("Monetary", "mean"),
-          )
-          .sort_values("客户人数", ascending=True)  # 升序排列，让人数最多的排在最上方
-      )
-      total_rfm_users = segment_summary["客户人数"].sum()
-      segment_summary["人数占比"] = (
-          segment_summary["客户人数"] / total_rfm_users * 100
-      )
-      segment_summary["平均净消费"] = segment_summary["平均净消费"].round(2)
+            if filtered_rfm.empty:
+                st.info("当前筛选条件下没有符合的客户。")
+            else:
+                segment_summary = (
+                    filtered_rfm.groupby("客户分层", as_index=False)
+                    .agg(
+                        客户人数=("user_id", "count"),
+                        平均净消费=("Monetary", "mean"),
+                    )
+                    .sort_values("客户人数", ascending=True)  # 升序排列，让人数最多的排在最上方
+                )
+                total_rfm_users = segment_summary["客户人数"].sum()
+                segment_summary["人数占比"] = (
+                    segment_summary["客户人数"] / total_rfm_users * 100
+                )
+                segment_summary["平均净消费"] = segment_summary["平均净消费"].round(2)
 
-      # 组合一行简洁清晰的外部标签，适配电脑与手机屏幕
-      segment_summary["展示标签"] = segment_summary.apply(
-          lambda r: (
-              f"{int(r['客户人数'])}人 ({r['人数占比']:.1f}%) | 均消"
-              f" ¥{r['平均净消费']:,.0f}"
-          ),
-          axis=1,
-      )
+                # 组合一行简洁清晰的外部标签，适配电脑与手机屏幕
+                segment_summary["展示标签"] = segment_summary.apply(
+                    lambda r: (
+                        f"{int(r['客户人数'])}人 ({r['人数占比']:.1f}%) | 均消"
+                        f" ¥{r['平均净消费']:,.0f}"
+                    ),
+                    axis=1,
+                )
 
-      bar_chart = px.bar(
-          segment_summary,
-          x="客户人数",
-          y="客户分层",
-          orientation="h",
-          color="平均净消费",
-          # 从浅蓝到深蓝的渐变，彻底告别“白底隐身”
-          color_continuous_scale=["#93C5FD", "#3B82F6", "#1D4ED8", "#1E3A8A"],
-          text="展示标签",
-          custom_data=["人数占比", "平均净消费"],
-          labels={
-              "客户人数": "客户人数（人）",
-              "客户分层": "",
-              "平均净消费": "平均净消费（元）",
-          },
-      )
+                bar_chart = px.bar(
+                    segment_summary,
+                    x="客户人数",
+                    y="客户分层",
+                    orientation="h",
+                    color="平均净消费",
+                    # 从浅蓝到深蓝的渐变，彻底告别“白底隐身”
+                    color_continuous_scale=["#93C5FD", "#3B82F6", "#1D4ED8", "#1E3A8A"],
+                    text="展示标签",
+                    custom_data=["人数占比", "平均净消费"],
+                    labels={
+                        "客户人数": "客户人数（人）",
+                        "客户分层": "",
+                        "平均净消费": "平均净消费（元）",
+                    },
+                )
 
-      max_count = segment_summary["客户人数"].max()
-      # 只调用一次 update_traces，保留柱子的细边框与富文本标签
-      bar_chart.update_traces(
-          textposition="outside",
-          cliponaxis=False,
-          textfont=dict(size=13),
-          marker_line=dict(
-              color="#64748B", width=0.8
-          ),  # 给柱子加上极细边框，边界更锐利
-          hovertemplate=(
-              "<b>%{y}</b><br>客户人数：%{x} 人"
-              " (%{customdata:.1f}%)<br>平均净消费："
-              " ¥%{customdata:,.2f}<extra></extra>"
-          ),
-      )
-      bar_chart.update_layout(
-          height=max(380, len(segment_summary) * 52),  # 根据类别数量动态调整高度，手机端不拥挤
-          xaxis=dict(range=[0, max_count * 1.48], title="客户人数（人）"),
-          yaxis=dict(tickfont=dict(size=13)),
-          margin=dict(t=20, l=10, r=20, b=30),
-          coloraxis_colorbar=dict(
-              orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1
-          ),  # 色条放顶部水平展示，省出手机端左右宽度
-      )
-      st.plotly_chart(bar_chart, width="stretch")
+                max_count = segment_summary["客户人数"].max()
+                # 只调用一次 update_traces，保留柱子的细边框与富文本标签
+                bar_chart.update_traces(
+                    textposition="outside",
+                    cliponaxis=False,
+                    textfont=dict(size=13),
+                    marker_line=dict(
+                        color="#64748B", width=0.8
+                    ),  # 给柱子加上极细边框，边界更锐利
+                    hovertemplate=(
+                        "<b>%{y}</b><br>客户人数：%{x} 人"
+                        " (%{customdata:.1f}%)<br>平均净消费："
+                        " ¥%{customdata:,.2f}<extra></extra>"
+                    ),
+                )
+                bar_chart.update_layout(
+                    height=max(380, len(segment_summary) * 52),  # 根据类别数量动态调整高度，手机端不拥挤
+                    xaxis=dict(range=[0, max_count * 1.48], title="客户人数（人）"),
+                    yaxis=dict(tickfont=dict(size=13)),
+                    margin=dict(t=20, l=10, r=20, b=30),
+                    coloraxis_colorbar=dict(
+                        orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1
+                    ),  # 色条放顶部水平展示，省出手机端左右宽度
+                )
+                st.plotly_chart(bar_chart, width="stretch")
 
-      st.subheader("分层客户运营名单")
-      export_rfm = filtered_rfm[[
-          "user_id",
-          "name",
-          "city",
-          "Recency",
-          "Frequency",
-          "Monetary",
-          "客户分层",
-      ]].sort_values(by="Monetary", ascending=False)
+                st.subheader("分层客户运营名单")
+                export_rfm = filtered_rfm[[
+                    "user_id",
+                    "name",
+                    "city",
+                    "Recency",
+                    "Frequency",
+                    "Monetary",
+                    "客户分层",
+                ]].sort_values(by="Monetary", ascending=False)
 
-      st.download_button(
-          "导出运营名单 CSV",
-          data=export_rfm.to_csv(index=False).encode("utf-8-sig"),
-          file_name="rfm_customers.csv",
-          mime="text/csv",
-      )
-      st.dataframe(
-          export_rfm,
-          width="stretch",
-          hide_index=True,
-          column_config={
-              "user_id": st.column_config.NumberColumn("用户编号", width="small"),
-              "name": st.column_config.TextColumn("用户姓名", width="small"),
-              "city": st.column_config.TextColumn("所在城市", width="small"),
-              "Recency": st.column_config.NumberColumn(
-                  "最近消费间隔(天)", width="small"
-              ),
-              "Frequency": st.column_config.NumberColumn(
-                  "下单次数", width="small"
-              ),
-              "Monetary": st.column_config.NumberColumn(
-                  "净消费总额", format="¥%.2f", width="small"
-              ),
-              "客户分层": st.column_config.TextColumn("客户分层", width="large"),
-          },
-      )
+                if user_perms["can_export"]:
+                    st.download_button(
+                        "导出运营名单 CSV",
+                        data=export_rfm.to_csv(index=False).encode("utf-8-sig"),
+                        file_name="rfm_customers.csv",
+                        mime="text/csv",
+                    )
+                else:
+                    st.caption("🔒 当前角色仅限在线查阅，无敏感名单导出权限。")
+                
+                st.dataframe(
+                    export_rfm,
+                    width="stretch",
+                    hide_index=True,
+                    column_config={
+                        "user_id": st.column_config.NumberColumn("用户编号", width="small"),
+                        "name": st.column_config.TextColumn("用户姓名", width="small"),
+                        "city": st.column_config.TextColumn("所在城市", width="small"),
+                        "Recency": st.column_config.NumberColumn(
+                            "最近消费间隔(天)", width="small"
+                        ),
+                        "Frequency": st.column_config.NumberColumn(
+                            "下单次数", width="small"
+                        ),
+                        "Monetary": st.column_config.NumberColumn(
+                            "净消费总额", format="¥%.2f", width="small"
+                        ),
+                        "客户分层": st.column_config.TextColumn("客户分层", width="large"),
+                    },
+                )
 
-with monitor_tab:
-  # 展示上一次提交成功后 rerun 保留的 flash 消息（展示一次即清空）
-  flash_msg = st.session_state.pop("milk_flash_msg", None)
-  if flash_msg:
-    st.success(flash_msg)
+if "📈 价格监控与 AI 助手 (RAG)" in tab_map:
+  with tab_map["📈 价格监控与 AI 助手 (RAG)"]:
+    # 展示上一次提交成功后 rerun 保留的 flash 消息（展示一次即清空）
+    flash_msg = st.session_state.pop("milk_flash_msg", None)
+    if flash_msg:
+      st.success(flash_msg)
 
-  st.subheader("双轨商品价格与状态监控中心")
-  p_col1, p_col2 = st.columns(2)
+    st.subheader("双轨商品价格与状态监控中心")
+    p_col1, p_col2 = st.columns(2)
 
-  with p_col1:
-    st.markdown("#### 🟡 路线一：黄金行情近 30 天走势（全自动采集）")
-    if gold_prices.empty:
-      st.info("暂无黄金行情数据，请先运行 `gold_tracker.py`。")
-    else:
-      latest_gold = gold_prices.iloc[-1]["price_cny_g"]
-      first_gold = gold_prices.iloc[0]["price_cny_g"]
-      diff_gold = latest_gold - first_gold
-      st.metric(
-          "最新参考金价（元/克）",
-          f"¥{latest_gold:,.2f}",
-          f"{diff_gold:+.2f} 元（近30日）",
-      )
-      g_chart = px.line(
-          gold_prices,
-          x="record_date",
-          y="price_cny_g",
-          markers=True,
-          labels={"record_date": "日期", "price_cny_g": "价格（元/克）"},
-      )
-      g_chart.update_layout(
-          height=350,
-          xaxis_title=None,
-          yaxis_title="元/克",
-          margin=dict(t=10, l=10, r=10, b=10),
-      )
-      st.plotly_chart(g_chart, width="stretch")
-
-  with p_col2:
-    st.markdown("#### 🥛 路线二：牛奶人工采价与下架状态闭环")
-
-    with st.expander("📝 在线录入今日牛奶价格 / 下架反馈", expanded=False):
-      with st.form("milk_entry_form", clear_on_submit=False):
-        f_date = st.date_input("记录日期", value=datetime.now().date())
-        f_product = st.text_input("商品名称", value="某品牌鲜牛奶 950ml")
-        f_delisted = st.checkbox("🚨 该产品已下架（勾选后无需填写价格）")
-        f_price = st.number_input(
-            "当前售价（元）", min_value=0.0, value=19.9, step=0.1
+    with p_col1:
+      st.markdown("#### 🟡 路线一：黄金行情近 30 天走势（全自动采集）")
+      if gold_prices.empty:
+        st.info("暂无黄金行情数据，请先运行 `gold_tracker.py`。")
+      else:
+        latest_gold = gold_prices.iloc[-1]["price_cny_g"]
+        first_gold = gold_prices.iloc[0]["price_cny_g"]
+        diff_gold = latest_gold - first_gold
+        st.metric(
+            "最新参考金价（元/克）",
+            f"¥{latest_gold:,.2f}",
+            f"{diff_gold:+.2f} 元（近30日）",
         )
-        f_feedback = st.text_input(
-            "状态或下架原因备注",
-            placeholder="例如：正常在售 / 周末促销 / 货架已清空",
-        )
-        submitted = st.form_submit_button("提交并同步至云端数据库")
-
-        if submitted:
-          ok, msg = save_milk_record_and_sync(
-              f_date.strftime("%Y-%m-%d"),
-              f_product,
-              f_delisted,
-              f_price,
-              f_feedback,
-          )
-          if ok:
-            st.session_state["milk_flash_msg"] = msg  # flash：rerun 后在 monitor_tab 顶部展示
-            st.cache_data.clear()  # 清除缓存使页面图表立刻刷新出最新数据
-            st.rerun()
-          else:
-            st.warning(msg)
-
-    if milk_prices.empty:
-      st.info("暂无牛奶采价记录，请先运行 `milk_watchdog.py`。")
-    else:
-      latest_milk = milk_prices.iloc[-1]
-      status_str = latest_milk["status"]
-      price_display = (
-          f"¥{latest_milk['price']:.2f}"
-          if pd.notna(latest_milk["price"])
-          else "已下架（无报价）"
-      )
-      st.metric(
-          f"最新状态（{latest_milk['record_date']}）",
-          price_display,
-          status_str,
-          delta_color="normal" if status_str == "在售" else "inverse",
-      )
-      # 仅对有价格的日期绘制折线，并在表格中完整展示包括“已下架”在内的所有反馈闭环
-      valid_milk = milk_prices.dropna(subset=["price"])
-      if not valid_milk.empty:
-        m_chart = px.line(
-            valid_milk,
+        g_chart = px.line(
+            gold_prices,
             x="record_date",
-            y="price",
+            y="price_cny_g",
             markers=True,
-            labels={"record_date": "日期", "price": "价格（元）"},
+            labels={"record_date": "日期", "price_cny_g": "价格（元/克）"},
         )
-        m_chart.update_layout(
-            height=240,
+        g_chart.update_layout(
+            height=350,
             xaxis_title=None,
-            yaxis_title="元",
+            yaxis_title="元/克",
             margin=dict(t=10, l=10, r=10, b=10),
         )
-        st.plotly_chart(m_chart, width="stretch")
+        st.plotly_chart(g_chart, width="stretch")
 
-      milk_display = milk_prices[[
-          "record_date",
-          "status",
-          "price",
-          "feedback",
-      ]].copy()
-      # 自动精简历史遗留的冗余前缀，让旧数据也清爽显示
-      milk_display["feedback"] = milk_display["feedback"].str.replace(
-          r"^\d{4}年\d{1,2}月\d{1,2}日该产品已下架（(?:原)?备注：(.*)）$",
-          r"\1",
-          regex=True,
-      )
-      st.dataframe(
-          milk_display,
-          width="stretch",
-          hide_index=True,
-          column_config={
-              "record_date": st.column_config.TextColumn(
-                  "记录日期", width="small"
-              ),
-              "status": st.column_config.TextColumn("状态", width="small"),
-              "price": st.column_config.NumberColumn(
-                  "价格", format="¥%.2f", width="small"
-              ),
-              "feedback": st.column_config.TextColumn(
-                  "状态/下架反馈记录", width="medium"
-              ),
-          },
-      )
+    with p_col2:
+      st.markdown("#### 🥛 路线二：牛奶人工采价与下架状态闭环")
 
-  st.divider()
-  st.subheader("🤖 私有数据 RAG 智能分析助手")
-  st.caption(
-      "支持多轮连续追问与一键业务诊断（填 API Key 可调用大模型深度推理，不填也可使用内置多意图检索引擎）。"
-  )
+      with st.expander("📝 在线录入今日牛奶价格 / 下架反馈", expanded=False):
+        with st.form("milk_entry_form", clear_on_submit=False):
+          f_date = st.date_input("记录日期", value=datetime.now().date())
+          f_product = st.text_input("商品名称", value="某品牌鲜牛奶 950ml")
+          f_delisted = st.checkbox("🚨 该产品已下架（勾选后无需填写价格）")
+          f_price = st.number_input(
+              "当前售价（元）", min_value=0.0, value=19.9, step=0.1
+          )
+          f_feedback = st.text_input(
+              "状态或下架原因备注",
+              placeholder="例如：正常在售 / 周末促销 / 货架已清空",
+          )
+          submitted = st.form_submit_button("提交并同步至云端数据库")
 
-  with st.expander("⚙️ 大模型 API 配置（可选）", expanded=False):
-    c1, c2, c3 = st.columns(3)
-    rag_api_key = c1.text_input("API Key", type="password", placeholder="sk-...")
-    rag_base_url = c2.text_input("Base URL", value="https://deepseek.com")
-    rag_model = c3.text_input("模型名称", value="deepseek-chat")
+          if submitted:
+            ok, msg = save_milk_record_and_sync(
+                f_date.strftime("%Y-%m-%d"),
+                f_product,
+                f_delisted,
+                f_price,
+                f_feedback,
+            )
+            if ok:
+              st.session_state["milk_flash_msg"] = msg
+              st.cache_data.clear()
+              st.rerun()
+            else:
+              st.warning(msg)
 
-  # 初始化对话历史
-  if "rag_messages" not in st.session_state:
-    st.session_state.rag_messages = [{
-        "role": "assistant",
-        "content": (
-            "你好！我是你的专属商业数据分析助手。你可以点击下方快捷按钮，或直接输入问题向数据库提问："
-        ),
-    }]
-
-  # 快捷提问按钮栏（点一下直接提问，不用手动打字）
-  q_cols = st.columns(4)
-  quick_prompts = [
-      ("📊 整体经营与退货诊断", "请帮我诊断当前的整体销售、净销售额和退货表现"),
-      ("💎 核心金主与客户分布", "目前有多少核心金主？客户分层分布如何？"),
-      ("🟡 黄金近30日高低点", "近30天黄金价格最高和最低分别是多少？"),
-      ("🥛 牛奶采价与下架复盘", "汇总一下牛奶的采价均价和下架记录"),
-  ]
-  triggered_prompt = None
-  for idx, (btn_label, prompt_text) in enumerate(quick_prompts):
-    if q_cols[idx].button(btn_label, use_container_width=True):
-      triggered_prompt = prompt_text
-
-  # 渲染历史对话气泡
-  for msg in st.session_state.rag_messages:
-    with st.chat_message(msg["role"]):
-      st.markdown(msg["content"])
-
-  # 接收快捷按钮或输入框提问
-  chat_input_text = st.chat_input(
-      "输入问题，例如：哪个城市销售额最高？牛奶最近下架过吗？"
-  )
-  final_question = triggered_prompt or chat_input_text
-
-  if final_question:
-    st.session_state.rag_messages.append(
-        {"role": "user", "content": final_question}
-    )
-    with st.chat_message("user"):
-      st.markdown(final_question)
-
-    rag_bundle = retrieve_rag_context(
-        final_question, orders, rfm_customers, gold_prices, milk_prices
-    )
-    with st.chat_message("assistant"):
-      with st.spinner("正在检索多表数据并生成分析..."):
-        reply = generate_rag_answer(
-            final_question,
-            st.session_state.rag_messages[:-1],
-            rag_bundle,
-            rag_api_key,
-            rag_base_url,
-            rag_model,
+      if milk_prices.empty:
+        st.info("暂无牛奶采价记录，请先运行 `milk_watchdog.py`。")
+      else:
+        latest_milk = milk_prices.iloc[-1]
+        status_str = latest_milk["status"]
+        price_display = (
+            f"¥{latest_milk['price']:.2f}"
+            if pd.notna(latest_milk["price"])
+            else "已下架（无报价）"
         )
-      st.markdown(reply)
-      with st.expander("🔍 查看底层检索到的数据库上下文"):
-        st.text(rag_bundle["context_str"])
+        st.metric(
+            f"最新状态（{latest_milk['record_date']}）",
+            price_display,
+            status_str,
+            delta_color="normal" if status_str == "在售" else "inverse",
+        )
+        valid_milk = milk_prices.dropna(subset=["price"])
+        if not valid_milk.empty:
+          m_chart = px.line(
+              valid_milk,
+              x="record_date",
+              y="price",
+              markers=True,
+              labels={"record_date": "日期", "price": "价格（元）"},
+          )
+          m_chart.update_layout(
+              height=240,
+              xaxis_title=None,
+              yaxis_title="元",
+              margin=dict(t=10, l=10, r=10, b=10),
+          )
+          st.plotly_chart(m_chart, width="stretch")
 
-    st.session_state.rag_messages.append({"role": "assistant", "content": reply})
+        milk_display = milk_prices[[
+            "record_date",
+            "status",
+            "price",
+            "feedback",
+        ]].copy()
+        milk_display["feedback"] = milk_display["feedback"].str.replace(
+            r"^\d{4}年\d{1,2}月\d{1,2}日该产品已下架（(?:原)?备注：(.*)）$",
+            r"\1",
+            regex=True,
+        )
+        st.dataframe(
+            milk_display,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "record_date": st.column_config.TextColumn(
+                    "记录日期", width="small"
+                ),
+                "status": st.column_config.TextColumn("状态", width="small"),
+                "price": st.column_config.NumberColumn(
+                    "价格", format="¥%.2f", width="small"
+                ),
+                "feedback": st.column_config.TextColumn(
+                    "状态/下架反馈记录", width="medium"
+                ),
+            },
+        )
+
+    st.divider()
+    st.subheader("🤖 私有数据 RAG 智能分析助手")
+    if not user_perms["can_use_rag"]:
+      st.warning(
+          "🔒 权限受限：当前岗位（一线采价专员）无权使用全局 AI"
+          " 数据分析助手，仅可使用上方采价录入功能。"
+      )
+    else:
+      st.caption(
+          "支持多轮连续追问与一键业务诊断（填 API Key 可调用大模型深度推理，不填也可使用内置多意图检索引擎）。"
+      )
+
+      with st.expander("⚙️ 大模型 API 配置（可选）", expanded=False):
+        c1, c2, c3 = st.columns(3)
+        rag_api_key = c1.text_input("API Key", type="password", placeholder="sk-...")
+        rag_base_url = c2.text_input("Base URL", value="https://deepseek.com")
+        rag_model = c3.text_input("模型名称", value="deepseek-chat")
+
+      if "rag_messages" not in st.session_state:
+        st.session_state.rag_messages = [{
+            "role": "assistant",
+            "content": (
+                "你好！我是你的专属商业数据分析助手。你可以点击下方快捷按钮，或直接输入问题向数据库提问："
+            ),
+        }]
+
+      q_cols = st.columns(4)
+      quick_prompts = [
+          ("📊 整体经营与退货诊断", "请帮我诊断当前的整体销售、净销售额和退货表现"),
+          ("💎 核心金主与客户分布", "目前有多少核心金主？客户分层分布如何？"),
+          ("🟡 黄金近30日高低点", "近30天黄金价格最高和最低分别是多少？"),
+          ("🥛 牛奶采价与下架复盘", "汇总一下牛奶的采价均价和下架记录"),
+      ]
+      triggered_prompt = None
+      for idx, (btn_label, prompt_text) in enumerate(quick_prompts):
+        if q_cols[idx].button(btn_label, use_container_width=True):
+          triggered_prompt = prompt_text
+
+      for msg in st.session_state.rag_messages:
+        with st.chat_message(msg["role"]):
+          st.markdown(msg["content"])
+
+      chat_input_text = st.chat_input(
+          "输入问题，例如：哪个城市销售额最高？牛奶最近下架过吗？"
+      )
+      final_question = triggered_prompt or chat_input_text
+
+      if final_question:
+        st.session_state.rag_messages.append(
+            {"role": "user", "content": final_question}
+        )
+        with st.chat_message("user"):
+          st.markdown(final_question)
+
+        rag_bundle = retrieve_rag_context(
+            final_question, orders, rfm_customers, gold_prices, milk_prices
+        )
+        with st.chat_message("assistant"):
+          with st.spinner("正在检索多表数据并生成分析..."):
+            reply = generate_rag_answer(
+                final_question,
+                st.session_state.rag_messages[:-1],
+                rag_bundle,
+                rag_api_key,
+                rag_base_url,
+                rag_model,
+            )
+          st.markdown(reply)
+          with st.expander("🔍 查看底层检索到的数据库上下文"):
+            st.text(rag_bundle["context_str"])
+
+        st.session_state.rag_messages.append(
+            {"role": "assistant", "content": reply}
+        )
+
+if "🔐 权限与账号管理" in tab_map:
+  with tab_map["🔐 权限与账号管理"]:
+    st.subheader("🔐 企业级权限与账号管理中心（仅 Admin 可见）")
+    st.caption(
+        "管理员可在此查阅所有系统账号的角色分配、修改岗位权限，或新增业务人员账号。"
+    )
+
+    # 1. 展示当前系统所有账号与权限矩阵
+    with closing(sqlite3.connect(DATABASE_PATH)) as conn:
+      users_df = pd.read_sql_query(
+          "SELECT username AS 登录账号, display_name AS 姓名, role AS"
+          " 岗位角色, department AS 所属部门, created_at AS 创建时间 FROM"
+          " sys_users",
+          conn,
+      )
+    st.markdown("#### 📋 当前系统账号列表")
+    st.dataframe(users_df, width="stretch", hide_index=True)
+
+    st.divider()
+    col_add, col_edit = st.columns(2)
+
+    # 2. 新增业务人员账号
+    with col_add:
+      st.markdown("#### ➕ 新增系统用户")
+      with st.form("admin_create_user_form", clear_on_submit=True):
+        new_u = st.text_input("登录账号（英文/数字）", placeholder="例如：op_gz")
+        new_name = st.text_input("显示姓名", placeholder="例如：赵专员 (广州)")
+        new_dept = st.text_input("所属部门", placeholder="例如：华南大区采价组")
+        new_role = st.selectbox("分配角色", list(ROLE_PERMISSIONS.keys()))
+        new_pwd = st.text_input("初始密码", type="password", value="123456")
+        btn_create = st.form_submit_button(
+            "创建账号", use_container_width=True
+        )
+
+        if btn_create:
+          if not new_u.strip() or not new_name.strip() or not new_pwd.strip():
+            st.error("请完整填写账号、姓名与初始密码。")
+          else:
+            try:
+              now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+              with closing(sqlite3.connect(DATABASE_PATH)) as conn:
+                conn.execute(
+                    "INSERT INTO sys_users (username, password_hash,"
+                    " display_name, role, department, created_at) VALUES (?,"
+                    " ?, ?, ?, ?, ?)",
+                    (
+                        new_u.strip(),
+                        hash_password(new_pwd.strip()),
+                        new_name.strip(),
+                        new_role,
+                        new_dept.strip(),
+                        now_str,
+                    ),
+                )
+                conn.commit()
+              st.success(f"✅ 成功创建账号 `{new_u.strip()}`（角色：{new_role}）！")
+              st.rerun()
+            except sqlite3.IntegrityError:
+              st.error(f"❌ 账号 `{new_u.strip()}` 已存在，请更换账号名。")
+
+    # 3. 调整现有账号岗位角色
+    with col_edit:
+      st.markdown("#### 🔄 调整现有人员角色")
+      existing_usernames = users_df["登录账号"].tolist()
+      with st.form("admin_update_role_form"):
+        target_u = st.selectbox("选择需要调整的账号", existing_usernames)
+        updated_role = st.selectbox(
+            "变更为新角色", list(ROLE_PERMISSIONS.keys())
+        )
+        btn_update = st.form_submit_button(
+            "更新角色权限", use_container_width=True
+        )
+
+        if btn_update:
+          if target_u == "admin" and updated_role != "Admin":
+            st.warning("⚠️ 为防止系统锁定，不可降级默认超级管理员 `admin`。")
+          else:
+            with closing(sqlite3.connect(DATABASE_PATH)) as conn:
+              conn.execute(
+                  "UPDATE sys_users SET role = ? WHERE username = ?",
+                  (updated_role, target_u),
+              )
+              conn.commit()
+            st.success(
+                f"✅ 已将 `{target_u}` 的角色变更为 `{updated_role}`（下次登录生效）。"
+            )
+            st.rerun()
