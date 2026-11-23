@@ -338,15 +338,21 @@ def calculate_rfm(orders: pd.DataFrame) -> pd.DataFrame:
         Monetary=("net_amount", "sum"),
     )
     rfm["Monetary"] = rfm["Monetary"].round(2)
-    rfm["R_Score"] = pd.qcut(
-        rfm["Recency"], q=5, labels=[5, 4, 3, 2, 1]
-    ).astype(int)
-    rfm["F_Score"] = pd.qcut(
-        rfm["Frequency"].rank(method="first"), q=5, labels=[1, 2, 3, 4, 5]
-    ).astype(int)
-    rfm["M_Score"] = pd.qcut(
-        rfm["Monetary"], q=5, labels=[1, 2, 3, 4, 5]
-    ).astype(int)
+
+    if len(rfm) < 5:
+        rfm["R_Score"] = 3
+        rfm["F_Score"] = 3
+        rfm["M_Score"] = 3
+    else:
+        rfm["R_Score"] = pd.qcut(
+            rfm["Recency"].rank(method="first"), q=5, labels=[5, 4, 3, 2, 1]
+        ).astype(int)
+        rfm["F_Score"] = pd.qcut(
+            rfm["Frequency"].rank(method="first"), q=5, labels=[1, 2, 3, 4, 5]
+        ).astype(int)
+        rfm["M_Score"] = pd.qcut(
+            rfm["Monetary"].rank(method="first"), q=5, labels=[1, 2, 3, 4, 5]
+        ).astype(int)
 
     def segment_customer(row: pd.Series) -> str:
         r_high = row["R_Score"] >= 3
